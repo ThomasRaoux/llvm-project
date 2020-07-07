@@ -502,6 +502,23 @@ struct LinalgCopyVTWForwardingPattern
                                 PatternRewriter &rewriter) const override;
 };
 
+/// Canonicalize AffineMinOp operations in the context of enclosing scf.for and
+/// scf.parallel by:
+///   1. building an affine map where uses of the induction variable of a loop
+///   are replaced by a `%lb + %step * floorDiv(%iv - %lb, %step)` expression.
+///   2. checking whether any of the results of this affine map divides all the
+///   other results (in which case it is also guaranteed to be the min).
+///   3. replacing the AffineMinOp by the result of (2).
+// TODO: move to a more appropriate place when it is determined. For now Linalg
+// depends both on Affine and SCF but they do not depend on each other.
+struct AffineMinSCFCanonicalizationPattern
+    : public OpRewritePattern<AffineMinOp> {
+  using OpRewritePattern<AffineMinOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(AffineMinOp minOp,
+                                PatternRewriter &rewriter) const override;
+};
+
 //===----------------------------------------------------------------------===//
 // Support for staged pattern application.
 //===----------------------------------------------------------------------===//
@@ -519,6 +536,7 @@ LogicalResult applyStagedPatterns(
     Operation *op, ArrayRef<OwningRewritePatternList> stage1Patterns,
     const OwningRewritePatternList &stage2Patterns,
     function_ref<LogicalResult(Operation *)> stage3Lambda = nullptr);
+
 } // namespace linalg
 } // namespace mlir
 

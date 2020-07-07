@@ -36,6 +36,7 @@ using namespace mlir::edsc::intrinsics;
 using namespace mlir::linalg;
 
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE << "]: ")
+
 //===----------------------------------------------------------------------===//
 // Transformations exposed as rewrite patterns.
 //===----------------------------------------------------------------------===//
@@ -234,4 +235,148 @@ LogicalResult mlir::linalg::applyStagedPatterns(
     }
   }
   return success();
+}
+
+/// Substitute the AffineExprDim at position `dimIdx`, which corresponds to a
+/// loop induction variable (e.g. scf.for %iv = %lb to %ub step %step) by the
+/// AffineExpr representing `%lb + %step * floorDiv(%iv - %lb, %step)` such
+/// that:
+/// 1. the AffineExpr for %lb is either an AffineConstantExpr or an
+///    AffineDimExpr depending on whether the value is constant or not.
+/// 2. the AffineExpr for %step is either an AffineConstantExpr or an
+///    AffineSymbolExpr depending on whether the value is constant or not.
+static void substituteLoop(unsigned dimIdx, Value lbVal, Value ubVal,
+                           Value stepVal, SmallVectorImpl<AffineExpr> &exprs,
+                           SmallVectorImpl<Value> &dims,
+                           SmallVectorImpl<Value> &symbols) {
+  MLIRContext *ctx = lbVal.getContext();
+
+  // 1. maybe add a new dim for the `lb`.
+  auto lbConstant = lbVal.getDefiningOp<ConstantIndexOp>();
+  AffineExpr lb = lbConstant ? getAffineConstantExpr(lbConstant.getValue(), ctx)
+                             : getAffineDimExpr(dims.size(), ctx);
+  if (!lbConstant)
+    dims.push_back(lbVal);
+
+  // 2. maybe add a new symbol for the `step`.
+  auto stepConstant = stepVal.getDefiningOp<ConstantIndexOp>();
+  AffineExpr step = stepConstant
+                        ? getAffineConstantExpr(stepConstant.getValue(), ctx)
+                        : getAffineSymbolExpr(symbols.size(), ctx);
+  if (!stepConstant)
+    symbols.push_back(stepVal);
+
+  // 3. Rewrite `exprs` in place by replacing `dim[dimIdx]` by `lb + step * iv`.
+  AffineExpr iv = getAffineDimExpr(dimIdx, ctx);
+  for (auto &e : exprs)
+    e = e.replace(iv, lb + step * (iv - lb).floorDiv(step));
+}
+
+/// Traverse the `dims` and substitute linear expressions in place of induction
+/// variables in `exprs`.
+static void substitute(SmallVectorImpl<AffineExpr> &exprs,
+                       SmallVectorImpl<Value> &dims,
+                       SmallVectorImpl<Value> &symbols) {
+  assert(!exprs.empty() && "Unexpected empty exprs");
+  LLVM_DEBUG(llvm::interleaveComma(dims, DBGS() << "Start subst with dims: "));
+  LLVM_DEBUG(llvm::dbgs() << "\n");
+
+  // Note: `dims` and `symbols` grow as we iterate, upper bound is dynamic.
+  for (unsigned dimIdx = 0; dimIdx < dims.size(); ++dimIdx) {
+    Value dim = dims[dimIdx];
+    LLVM_DEBUG(DBGS() << "Subst: " << dim << "\n");
+
+    // Replace dim @ pos[dimIdx] by `%lb + %step * new_dim`
+    // Where new dim / symbols are added depending on whether the values are
+    // static or not.
+    if (auto forOp = scf::getForInductionVarOwner(dim)) {
+      substituteLoop(dimIdx, forOp.lowerBound(), forOp.upperBound(),
+                     forOp.step(), exprs, dims, symbols);
+      continue;
+    }
+    if (auto parallelForOp = scf::getParallelForInductionVarOwner(dim)) {
+      for (unsigned idx = 0, e = parallelForOp.getNumLoops(); idx < e; ++idx)
+        substituteLoop(dimIdx, parallelForOp.lowerBound()[idx],
+                       parallelForOp.upperBound()[idx],
+                       parallelForOp.step()[idx], exprs, dims, symbols);
+      continue;
+    }
+  }
+
+  // Cleanup and simplify the results.
+  SmallVector<Value, 4> operands(dims.begin(), dims.end());
+  operands.append(symbols.begin(), symbols.end());
+  auto map = AffineMap::get(dims.size(), symbols.size(), exprs,
+                            exprs.front().getContext());
+  // Pull in affine.apply operations and compose them fully into the result.
+  fullyComposeAffineMapAndOperands(&map, &operands);
+  canonicalizeMapAndOperands(&map, &operands);
+  map = simplifyAffineMap(map);
+  // Assign the results.
+  exprs.assign(map.getResults().begin(), map.getResults().end());
+  dims.assign(operands.begin(), operands.begin() + map.getNumDims());
+  symbols.assign(operands.begin() + map.getNumDims(), operands.end());
+}
+
+LogicalResult AffineMinSCFCanonicalizationPattern::matchAndRewrite(
+    AffineMinOp minOp, PatternRewriter &rewriter) const {
+  // At least one loop is needed to canonicalize affine.min + SCF.
+  auto isLoopLike = [](Value v) {
+    return scf::getParallelForInductionVarOwner(v) ||
+           scf::getForInductionVarOwner(v);
+  };
+  if (llvm::none_of(minOp.getDimOperands(), isLoopLike))
+    return failure();
+
+  LLVM_DEBUG(DBGS() << "Canonicalize AffineMinSCF: " << *minOp.getOperation()
+                    << "\n");
+
+  auto exprs = llvm::to_vector<4>(minOp.getAffineMap().getResults());
+  SmallVector<Value, 4> dims(minOp.getDimOperands()),
+      symbols(minOp.getSymbolOperands());
+  substitute(exprs, dims, symbols);
+
+  MLIRContext *ctx = minOp.getContext();
+  auto map = AffineMap::get(dims.size(), symbols.size(), exprs, ctx);
+  LLVM_DEBUG(DBGS() << "Resulting map: " << map << "\n");
+
+  // Check whether any of the expressions divides all expressions. In which case
+  // it is guaranteed to be the min.
+  for (auto e : map.getResults()) {
+    LLVM_DEBUG(DBGS() << "Candidate mod: " << e << "\n");
+    if (!e.isSymbolicOrConstant())
+      continue;
+
+    LLVM_DEBUG(DBGS() << "Check whether mod: " << e << " is zero\n");
+    SmallVector<AffineExpr, 4> modExprs;
+    for (auto ee : map.getResults())
+      modExprs.push_back(ee % e);
+
+    AffineMap modMap = simplifyAffineMap(
+        AffineMap::get(map.getNumDims(), map.getNumSymbols(), modExprs, ctx));
+    LLVM_DEBUG(DBGS() << "simplified modMap: " << modMap << "\n");
+
+    auto isZero = [](AffineExpr e) {
+      if (auto cst = e.dyn_cast<AffineConstantExpr>())
+        return cst.getValue() == 0;
+      return false;
+    };
+    if (llvm::all_of(modMap.getResults(), isZero)) {
+      if (auto cst = e.dyn_cast<AffineConstantExpr>()) {
+        rewriter.replaceOpWithNewOp<ConstantIndexOp>(minOp, cst.getValue());
+      } else {
+        auto resultMap =
+            AffineMap::get(map.getNumDims(), map.getNumSymbols(), {e}, ctx);
+        SmallVector<Value, 4> resultOperands = dims;
+        resultOperands.append(symbols.begin(), symbols.end());
+        canonicalizeMapAndOperands(&resultMap, &resultOperands);
+        resultMap = simplifyAffineMap(resultMap);
+        rewriter.replaceOpWithNewOp<AffineApplyOp>(minOp, resultMap,
+                                                   resultOperands);
+      }
+      return success();
+    }
+  }
+
+  return failure();
 }
