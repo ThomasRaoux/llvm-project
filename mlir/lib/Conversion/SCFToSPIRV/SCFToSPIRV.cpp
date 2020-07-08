@@ -91,13 +91,13 @@ template <typename ScfOp, typename OpTy>
 static void replaceSCFOutputValue(ScfOp scfOp, OpTy newOp,
                                   SPIRVTypeConverter &typeConverter,
                                   ConversionPatternRewriter &rewriter,
-                                  ScfToSPIRVContextImpl *scfToSPIRVContext) {
+                                  ScfToSPIRVContextImpl *scfToSPIRVContext,
+				  SmallVector<Type, 8> allocaType) {
 
   Location loc = scfOp.getLoc();
   auto &allocas = scfToSPIRVContext->outputVars[newOp];
   SmallVector<Value, 8> resultValue;
-  for (Value result : scfOp.results()) {
-    auto convertedType = typeConverter.convertType(result.getType());
+  for (Type convertedType : allocaType) {
     auto pointerType =
         spirv::PointerType::get(convertedType, spirv::StorageClass::Function);
     rewriter.setInsertionPoint(newOp);
@@ -185,8 +185,11 @@ ForOpConversion::matchAndRewrite(scf::ForOp forOp, ArrayRef<Value> operands,
       loc, newIndVar.getType(), newIndVar, forOperands.step());
   rewriter.create<spirv::BranchOp>(loc, header, updatedIndVar);
 
+  SmallVector<Type, 8> allocType;
+  for(auto arg : forOperands.initArgs())
+    allocType.push_back(arg.getType());
   replaceSCFOutputValue(forOp, loopOp, typeConverter, rewriter,
-                        scfToSPIRVContext);
+                        scfToSPIRVContext, allocType);
   return success();
 }
 
@@ -238,8 +241,13 @@ IfOpConversion::matchAndRewrite(scf::IfOp ifOp, ArrayRef<Value> operands,
                                               thenBlock, ArrayRef<Value>(),
                                               elseBlock, ArrayRef<Value>());
 
+  SmallVector<Type, 8> allocType;
+  for (auto result : ifOp.results()) {
+    auto convertedType = typeConverter.convertType(result.getType());
+    allocType.push_back(convertedType);
+  }
   replaceSCFOutputValue(ifOp, selectionOp, typeConverter, rewriter,
-                        scfToSPIRVContext);
+                        scfToSPIRVContext, allocType);
   return success();
 }
 

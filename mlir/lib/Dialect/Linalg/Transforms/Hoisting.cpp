@@ -140,11 +140,11 @@ void mlir::linalg::hoistRedundantVectorTransfers(FuncOp func) {
       DominanceInfo dom(loop);
       if (!dom.properlyDominates(transferRead.getOperation(), transferWrite))
         return WalkResult::advance();
-      for (auto &use : transferRead.memref().getUses())
+/*      for (auto &use : transferRead.memref().getUses())
         if (dom.properlyDominates(use.getOwner(),
                                   transferRead.getOperation()) ||
             dom.properlyDominates(transferWrite, use.getOwner()))
-          return WalkResult::advance();
+          return WalkResult::advance();*/
 
       // Hoist read before.
       if (failed(loop.moveOutOfLoop({transferRead})))
